@@ -3,8 +3,10 @@ package org.thobe.agent;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.OutputStream;
 import java.io.Serializable;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Field;
@@ -16,6 +18,8 @@ import java.rmi.server.RemoteObject;
 import java.util.jar.Attributes;
 import java.util.jar.JarFile;
 import java.util.jar.Manifest;
+import java.util.zip.DeflaterOutputStream;
+import java.util.zip.InflaterInputStream;
 
 import com.sun.tools.attach.AgentInitializationException;
 import com.sun.tools.attach.AgentLoadException;
@@ -57,11 +61,35 @@ public final class CallbackAgent implements Serializable
                 classpath.append( ':' ).append( codeSource );
             }
         }
-        this.callbackStub = serialize( stub );
-        this.invoker = serialize( invoker );
+        this.callbackStub = serialize( stub, false );
+        this.invoker = serialize( invoker, false );
         this.classpath = classpath.length() == 0 ? "" : classpath.substring( 1 );
         this.callback = callback;
         this.callbackInvoker = invoker;
+    }
+
+    public static void addToClasspath( Instrumentation instrumentation, String path )
+    {
+        JarFile jar;
+
+        try
+        {
+            jar = new JarFile( path );
+        }
+        catch ( IOException e )
+        {
+
+            try
+            {
+                jar = new JarFile( new JarCreator().createTemporaryJar( path ) );
+            }
+            catch ( IOException e1 )
+            {
+                throw new IllegalArgumentException(
+                        format( "'%s' is not a jar file (and cannot be converted to one)", path ) );
+            }
+        }
+        instrumentation.appendToSystemClassLoaderSearch( jar );
     }
 
     public void injectInto( String pid )
@@ -77,8 +105,7 @@ public final class CallbackAgent implements Serializable
             {
                 throw new IllegalArgumentException( "Could not attach to: " + pid, e );
             }
-            deployAgent( vm );
-            vm.detach();
+            deployAgent( serialized(), vm );
         }
         catch ( IOException e )
         {
@@ -88,6 +115,7 @@ public final class CallbackAgent implements Serializable
 
     public void injectIntoAll()
     {
+        String serializedAgent = serialized();
         for ( VirtualMachineDescriptor descriptor : VirtualMachine.list() )
         {
             try
@@ -104,13 +132,12 @@ public final class CallbackAgent implements Serializable
                 }
                 try
                 {
-                    deployAgent( vm );
+                    deployAgent( serializedAgent, vm );
                 }
                 catch ( IllegalStateException e )
                 {
                     attachFailed( descriptor, e.getCause() );
                 }
-                vm.detach();
             }
             catch ( IOException e )
             {
@@ -119,18 +146,11 @@ public final class CallbackAgent implements Serializable
         }
     }
 
-    @SuppressWarnings("unchecked")
-    private void attachFailed( VirtualMachineDescriptor descriptor, Throwable failure )
-            throws RemoteException
-    {
-        callbackInvoker.attachFailed( callback, descriptor, failure );
-    }
-
-    private void deployAgent( VirtualMachine vm ) throws IOException
+    private void deployAgent( String serializedAgent, VirtualMachine vm ) throws IOException
     {
         try
         {
-            vm.loadAgent( jarFile(), serialized() );
+            vm.loadAgent( jarFile(), serializedAgent );
         }
         catch ( AgentLoadException e )
         {
@@ -140,6 +160,17 @@ public final class CallbackAgent implements Serializable
         {
             throw new IllegalStateException( "Could not initialize agent: " + e.getMessage(), e );
         }
+        finally
+        {
+            vm.detach();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void attachFailed( VirtualMachineDescriptor descriptor, Throwable failure )
+            throws RemoteException
+    {
+        callbackInvoker.attachFailed( callback, descriptor, failure );
     }
 
     private static String verifyAgentJar( String jarPath )
@@ -182,7 +213,13 @@ public final class CallbackAgent implements Serializable
 
     private String serialized()
     {
-        return new BASE64Encoder().encode( serialize( this ) );
+        String serialized = new BASE64Encoder().encode( serialize( this, true ) ).replace( "\n", "" );
+        if ( serialized.length() > 1024 )
+        {
+            throw new IllegalStateException(
+                    format( "Serialized agent is too large [%s] (max 1024).", serialized.length() ) );
+        }
+        return serialized;
     }
 
     @SuppressWarnings("unchecked")
@@ -190,10 +227,10 @@ public final class CallbackAgent implements Serializable
     {
         for ( String jar : classpath.split( ":" ) )
         {
-            inst.appendToSystemClassLoaderSearch( new JarFile( jar ) );
+            addToClasspath( inst, jar );
         }
-        this.callback = deserialize( Remote.class, callbackStub );
-        this.callbackInvoker = deserialize( CallbackInvoker.class, invoker );
+        this.callback = deserialize( Remote.class, callbackStub, false );
+        this.callbackInvoker = deserialize( CallbackInvoker.class, invoker, false );
         new Thread( format( "%s{%s.invokeCallback(%s)}", getClass().getSimpleName(), callbackInvoker, callback ) )
         {
             @Override
@@ -243,12 +280,17 @@ public final class CallbackAgent implements Serializable
         deserialize( CallbackAgent.class, agentArgs ).load( inst );
     }
 
-    private static byte[] serialize( Object obj )
+    private static byte[] serialize( Object obj, boolean compressed )
     {
         ByteArrayOutputStream os = new ByteArrayOutputStream();
         try
         {
-            ObjectOutputStream oos = new ObjectOutputStream( os );
+            OutputStream out = os;
+            if ( compressed )
+            {
+                out = new DeflaterOutputStream( out );
+            }
+            ObjectOutputStream oos = new ObjectOutputStream( out );
             oos.writeObject( obj );
             oos.close();
         }
@@ -263,7 +305,7 @@ public final class CallbackAgent implements Serializable
     {
         try
         {
-            return deserialize( type, new BASE64Decoder().decodeBuffer( serialized ) );
+            return deserialize( type, new BASE64Decoder().decodeBuffer( serialized ), true );
         }
         catch ( IOException e )
         {
@@ -271,11 +313,17 @@ public final class CallbackAgent implements Serializable
         }
     }
 
-    private static <T> T deserialize( Class<T> type, byte[] serialized )
+    private static <T> T deserialize( Class<T> type, byte[] serialized, boolean compressed )
     {
+        ByteArrayInputStream is = new ByteArrayInputStream( serialized );
         try
         {
-            return type.cast( new ObjectInputStream( new ByteArrayInputStream( serialized ) ).readObject() );
+            InputStream in = is;
+            if ( compressed )
+            {
+                in = new InflaterInputStream( in );
+            }
+            return type.cast( new ObjectInputStream( in ).readObject() );
         }
         catch ( IOException e )
         {
