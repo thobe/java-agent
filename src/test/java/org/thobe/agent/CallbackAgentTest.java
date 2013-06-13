@@ -16,6 +16,7 @@ import sun.misc.Unsafe;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.thobe.testing.subprocess.TestProcesses.Option.AWAIT_STDERR_OUTPUT;
 
@@ -37,6 +38,7 @@ public class CallbackAgentTest
 
         // then
         String call = callback.awaitCall( 5, SECONDS );
+        assertFalse( "result should not be empty", call.isEmpty() );
         assertFalse( call, call.contains( "null" ) );
     }
 
