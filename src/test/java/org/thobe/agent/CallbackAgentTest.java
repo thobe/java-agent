@@ -18,12 +18,12 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
-import static org.thobe.testing.subprocess.TestProcesses.Option.AWAIT_STDERR_OUTPUT;
+import static org.thobe.testing.subprocess.TestProcesses.Option.AWAIT_STDOUT_OUTPUT;
 
 public class CallbackAgentTest
 {
     @Rule
-    public final TestProcesses subprocess = new TestProcesses( AWAIT_STDERR_OUTPUT );
+    public final TestProcesses subprocess = new TestProcesses( AWAIT_STDOUT_OUTPUT );
 
     @Test
     public void shouldLoadAgentAndInvokeCallback() throws Exception
